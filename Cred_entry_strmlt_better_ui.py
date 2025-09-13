@@ -1,11 +1,9 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-import os
-from pathlib import Path
-import openpyxl
-import json
-from io import BytesIO
+import gspread
+from gspread_dataframe import set_with_dataframe
+
 
 CASHIERS = sorted(["Misrak", "Emush", "Adanu", "Yemisrach", "Ejigayehu", "Tigist"])
 BANKS = sorted([
@@ -13,130 +11,82 @@ BANKS = sorted([
     "CBE", "Dashen", "Enat", "Hibret", "Lion", "Nib", "Telebirr", "Wegagen", "Zemen"
 ])
 HEADERS = ["ID", "Timestamp", "Cashier", "Bank", "Credit"]
-SESSION_STATE_FILE = "session_state.json"
+
+GOOGLE_SHEET_NAME = "Cred_entry"
 
 
-def get_today_str():
-   
-    return datetime.now().strftime("%Y-%m-%d")
-
-def save_session_state():
-   
-    if st.session_state.get("current_aggregate_file") and st.session_state.get("first_entry_date"):
-        state = {
-            "aggregate_file": st.session_state.current_aggregate_file,
-            "first_entry_date": st.session_state.first_entry_date
-        }
-        with open(SESSION_STATE_FILE, 'w') as f:
-            json.dump(state, f)
-
-def get_aggregate_excel_file():
-   
-    if Path(SESSION_STATE_FILE).exists():
-        try:
-            with open(SESSION_STATE_FILE, 'r') as f:
-                state = json.load(f)
-            st.session_state.current_aggregate_file = state.get("aggregate_file")
-            st.session_state.first_entry_date = state.get("first_entry_date")
-            return st.session_state.current_aggregate_file
-        except (IOError, json.JSONDecodeError):
-            if Path(SESSION_STATE_FILE).exists():
-                os.remove(SESSION_STATE_FILE)
-
-    Path(".").mkdir(exist_ok=True)
-    base_filename = f"aggregate_{get_today_str()}"
-    filename_to_use = f"{base_filename}.xlsx"
-    counter = 1
-    while Path(filename_to_use).exists():
-        filename_to_use = f"{base_filename}_{counter}.xlsx"
-        counter += 1
-
-    st.session_state.current_aggregate_file = filename_to_use
-    st.session_state.first_entry_date = get_today_str()
-    save_session_state()
-    return filename_to_use
-
-def get_next_id(ws):
-   
-    if ws.max_row <= 1:
-        return 1
-    max_id = 0
-    for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
-        cell_value = row[0]
-        if cell_value is not None:
-            try:
-                current_id = int(cell_value)
-                if current_id > max_id:
-                    max_id = current_id
-            except (ValueError, TypeError):
-                continue
-    return max_id + 1
-
-def save_entry(entry):
-    
-    filepath = get_aggregate_excel_file()
+def connect_to_gsheet():
     try:
-        wb = openpyxl.load_workbook(filepath)
-        ws = wb.active
-    except FileNotFoundError:
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "Entries"
-        ws.append(HEADERS)
+        
+        sa = gspread.service_account_from_dict(st.secrets["gcp_service_account"])
+       
+        sh = sa.open(GOOGLE_SHEET_NAME)
+        
+        ws = sh.get_worksheet(0)
+        return ws
+    except Exception as e:
+        st.error(f"Failed to connect to Google Sheets: {e}")
+        st.stop()
 
-    entry_id = get_next_id(ws)
-    entry["ID"] = entry_id
-    
-    data_row = [entry.get(h, "") for h in HEADERS]
-    ws.append(data_row)
-    wb.save(filepath)
-    save_session_state()
-    return entry
 
-def remove_entry_from_excel(entry_id):
-    
-    filepath = get_aggregate_excel_file()
-    if not os.path.exists(filepath):
-        return False, "File not found."
-    
-    wb = openpyxl.load_workbook(filepath)
-    ws = wb.active
-    row_to_delete = -1
-    
-    for row_index in range(2, ws.max_row + 1):
-        cell_id = ws.cell(row=row_index, column=1).value
-        if str(cell_id) == str(entry_id):
-            row_to_delete = row_index
-            break
-
-    if row_to_delete != -1:
-        ws.delete_rows(row_to_delete)
-        wb.save(filepath)
-        return True, f"Entry ID {entry_id} deleted successfully."
-    
-    wb.close()
-    return False, f"Could not find entry ID {entry_id} in the file."
-
-def load_data_from_excel():
-   
-    filepath = get_aggregate_excel_file()
-    if not os.path.exists(filepath):
-        return pd.DataFrame(columns=HEADERS)
+def load_data_from_gsheet(ws):
+    """Loads all data from the worksheet into a pandas DataFrame."""
     try:
-        df = pd.read_excel(filepath, engine='openpyxl')
+        df = pd.DataFrame(ws.get_all_records())
+        if df.empty:
+            return pd.DataFrame(columns=HEADERS)
+       
         if 'ID' in df.columns:
             df['ID'] = df['ID'].astype(str)
         return df
     except Exception as e:
-        st.error(f"Failed to load data from {filepath}: {e}")
+        st.error(f"Failed to load data from Google Sheet: {e}")
         return pd.DataFrame(columns=HEADERS)
 
-
-
-def cashier_selection_page():
+def get_next_id(df):
    
-    st.header("Select Cashier to Continue")
+    if df.empty or 'ID' not in df.columns:
+        return 1
     
+    max_id = pd.to_numeric(df['ID'], errors='coerce').max()
+    return int(max_id) + 1 if pd.notna(max_id) else 1
+
+def save_entry(ws, df, entry):
+    
+    try:
+        entry_id = get_next_id(df)
+        entry["ID"] = entry_id
+        
+        
+        data_row = [entry.get(h, "") for h in HEADERS]
+        
+       
+        ws.append_row(data_row, value_input_option='USER_ENTERED')
+        
+        st.success(f"Saved: ID {entry_id} | {entry['Bank']} - {entry['Credit']:,.2f}")
+        return True
+    except Exception as e:
+        st.error(f"Failed to save entry: {e}")
+        return False
+
+def remove_entry_from_gsheet(ws, entry_id):
+    
+    try:
+       
+        cell = ws.find(str(entry_id), in_column=1) 
+        if cell:
+            
+            ws.delete_rows(cell.row)
+            return True, f"Entry ID {entry_id} deleted successfully."
+        else:
+            return False, f"Could not find entry ID {entry_id}."
+    except Exception as e:
+        return False, f"An error occurred while deleting: {e}"
+
+# --- UI PAGES ---
+def cashier_selection_page():
+    
+    st.header("Select Cashier to Continue")
     cols = st.columns(2)
     for i, cashier in enumerate(CASHIERS):
         with cols[i % 2]:
@@ -144,22 +94,12 @@ def cashier_selection_page():
                 st.session_state.selected_cashier = cashier
                 st.rerun()
 
-def main_app_page():
-    """Displays the main application page for data entry and logging."""
-
+def main_app_page(ws):
     
     st.markdown("""
         <style>
-           
-            .main .block-container {
-                padding-top: 2rem;
-            }
-            
-            .bank-buttons .stButton button {
-                font-size: 1.2rem; 
-                font-weight: bold;   
-                height: 50px;
-            }
+            .main .block-container { padding-top: 2rem; }
+            .bank-buttons .stButton button { font-size: 1.2rem; font-weight: bold; height: 50px; }
         </style>
     """, unsafe_allow_html=True)
 
@@ -176,20 +116,17 @@ def main_app_page():
     with top_col2:
         st.markdown(f"## Welcome, **{cashier}**!")
 
-   
     if 'selected_bank' not in st.session_state:
         st.session_state.selected_bank = None
 
-   
+    
     col1, col2 = st.columns([1.5, 2])
 
-   
     with col1:
-        st.subheader("1. Select a Bank")
         
-       
+        st.subheader("1. Select a Bank")
         st.markdown('<div class="bank-buttons">', unsafe_allow_html=True)
-        bank_cols = st.columns(3) 
+        bank_cols = st.columns(3)
         for i, bank in enumerate(BANKS):
             col = bank_cols[i % 3]
             is_selected = (bank == st.session_state.selected_bank)
@@ -199,10 +136,10 @@ def main_app_page():
                 st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
 
+        
         st.subheader("2. Enter Amount & Submit")
         with st.form("entry_form", clear_on_submit=True):
             credit = st.number_input("Enter Credit Amount", min_value=0.01, format="%.2f", value=None)
-            
             submitted = st.form_submit_button("Submit Entry", use_container_width=True)
             if submitted:
                 bank = st.session_state.get("selected_bank")
@@ -212,19 +149,20 @@ def main_app_page():
                     st.warning("Please enter a credit amount.")
                 else:
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    entry_data = { "Timestamp": timestamp, "Bank": bank, "Credit": credit, "Cashier": cashier }
-                    try:
-                        saved_entry = save_entry(entry_data)
-                        st.success(f"Saved: ID {saved_entry['ID']} | {bank} - {credit:,.2f}")
-                    except Exception as e:
-                        st.error(f"Failed to save entry: {e}")
-
+                    entry_data = {"Timestamp": timestamp, "Bank": bank, "Credit": credit, "Cashier": cashier}
+                    
+                    df_for_id = load_data_from_gsheet(ws)
+                    if save_entry(ws, df_for_id, entry_data):
+                       
+                        pass
 
     with col2:
         st.subheader("Entries Log")
         
-        df = load_data_from_excel()
+        
+        df = load_data_from_gsheet(ws)
 
+       
         search_query = st.text_input("Search Entries", placeholder="Search by any column...")
         if search_query:
             mask = df.apply(lambda row: search_query.lower() in ' '.join(row.astype(str)).lower(), axis=1)
@@ -235,14 +173,11 @@ def main_app_page():
         display_df = filtered_df.sort_values(by="ID", ascending=False).reset_index(drop=True)
 
         st.dataframe(
-            display_df, 
-            use_container_width=True, 
-            hide_index=True,
-            key="entries_df",
-            on_select="rerun",
-            selection_mode="single-row"
+            display_df, use_container_width=True, hide_index=True,
+            key="entries_df", on_select="rerun", selection_mode="single-row"
         )
-
+        
+        
         st.markdown("---")
         st.subheader("Delete an Entry")
         st.write("Click a row in the table above to select it.")
@@ -255,10 +190,10 @@ def main_app_page():
                 
                 st.warning(f"You have selected Entry ID **{selected_id}** for deletion.")
                 if st.button(f"Confirm Deletion of ID {selected_id}", type="primary", use_container_width=True):
-                    success, message = remove_entry_from_excel(selected_id)
+                    success, message = remove_entry_from_gsheet(ws, selected_id)
                     if success:
                         st.success(message)
-                        st.rerun()
+                        st.rerun() 
                     else:
                         st.error(message)
             else:
@@ -267,23 +202,23 @@ def main_app_page():
              st.info("No entry selected.")
 
     
-    st.markdown("---") 
-    _, end_session_col = st.columns([4, 1]) 
+    st.markdown("---")
+    _, end_session_col = st.columns([4, 1])
     with end_session_col:
-        if st.button("❌ End Session"):
-            if Path(SESSION_STATE_FILE).exists():
-                os.remove(SESSION_STATE_FILE)
+        if st.button("🚪 Log Out"):
             st.session_state.clear()
-            st.success("Session ended. Please refresh the page to start a new one.")
-            st.stop()
+            st.success("You have been logged out. Select a cashier to begin a new session.")
+            st.rerun()
 
 
 
 if __name__ == "__main__":
     st.set_page_config(page_title="Credit Entry", layout="wide")
 
+   
+    worksheet = connect_to_gsheet()
+
     if 'selected_cashier' not in st.session_state:
         cashier_selection_page()
     else:
-        main_app_page()
-
+        main_app_page(worksheet)
